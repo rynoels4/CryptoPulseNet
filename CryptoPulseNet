@@ -1,17 +1,3 @@
-"""
-PyTorch version of High-Frequency Bitcoin Price Prediction
-
-Features:
-- .env support (python-dotenv)
-- Binance data fetch with pagination and Parquet cache (binance-connector)
-- TA-Lib feature engineering with safe numerics
-- MinMax scaling without leakage
-- Sliding-window dataset
-- PyTorch LSTM regressor with mixed precision (optional) and GPU support
-- Walk-forward validation with periodic retraining (no scaler refit)
-- Inverse-scale predictions for fair metrics and plots
-"""
-
 from __future__ import annotations
 
 import os
@@ -1842,3 +1828,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
