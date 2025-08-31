@@ -64,23 +64,7 @@ You can also override `Config` programmatically if you run the pipeline from ano
 Run the end-to-end pipeline (fetch → features → train → walk-forward → plots):
 
 ```bash
-python run_pipeline.py
-```
-
-Fetch & cache only (programmatic example):
-
-```python
-from pulsebtc.data import DataFetcher, Config
-cfg = Config()
-fetcher = DataFetcher(cfg)
-df = fetcher.fetch_and_cache()
-```
-
-Start microstructure stream (optional):
-
-```python
-from pulsebtc.micro import start_microstructure_stream
-start_microstructure_stream()
+python CryptoPulseNet.py
 ```
 
 ---
