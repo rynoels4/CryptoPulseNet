@@ -1,0 +1,1844 @@
+"""
+PyTorch version of High-Frequency Bitcoin Price Prediction
+
+Features:
+- .env support (python-dotenv)
+- Binance data fetch with pagination and Parquet cache (binance-connector)
+- TA-Lib feature engineering with safe numerics
+- MinMax scaling without leakage
+- Sliding-window dataset
+- PyTorch LSTM regressor with mixed precision (optional) and GPU support
+- Walk-forward validation with periodic retraining (no scaler refit)
+- Inverse-scale predictions for fair metrics and plots
+"""
+
+from __future__ import annotations
+
+import os
+import copy
+import time
+import logging
+import warnings
+import copy
+from typing import Tuple, List
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from dotenv import load_dotenv
+import joblib
+import talib
+
+from binance.spot import Spot as Client
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam
+try:
+    from torch.optim import AdamW
+except Exception:
+    AdamW = None
+from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR, CosineAnnealingLR
+
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# Optional TensorBoard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+
+# Optional Binance websocket for microstructure features
+try:
+    from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+except Exception:
+    SpotWebsocketStreamClient = None
+
+
+# ---------------------
+# Setup
+# ---------------------
+warnings.filterwarnings("ignore")
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+np.random.seed(42)
+torch.manual_seed(42)
+
+
+class Config:
+    # API
+    API_KEY = os.environ.get('BINANCE_API_KEY')
+    API_SECRET = os.environ.get('BINANCE_API_SECRET')
+
+    # Data
+    SYMBOL = 'BTCUSDT'
+    INTERVAL = '1m'
+    DATA_START_DATE = '2022-01-01'
+    CACHE_FILE = 'btc_1m_data.parquet'
+
+    # Modeling
+    N_STEPS = 120
+    TRAIN_SPLIT_RATIO = 0.8
+    VALIDATION_SPLIT = 0.1
+
+    # Training
+    BATCH_SIZE = 512
+    GRAD_ACCUM_STEPS = 8
+    EPOCHS = 100
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 1e-6
+
+    # Hybrid model (LSTM + Transformer) settings
+    USE_HYBRID = True
+    LSTM_HIDDEN = 192
+    LSTM_LAYERS = 1
+    LSTM_DROPOUT = 0.3
+    TR_D_MODEL = 384
+    TR_NHEAD = 8
+    TR_LAYERS = 3
+    TR_DROPOUT = 0.1
+    # Widen Transformer FFN to scale params; with d_model fixed, m=7.0 yields ~1.5x encoder params (vs m=4.0)
+    TR_FF_MULT = 7.0
+    HEAD_HIDDEN = 320
+    GRAD_CLIP_NORM = 1.0
+
+    # Multitask classification booster
+    MULTITASK = True
+    CLS_EPSILON = 2e-4
+    CLS_LOSS_WEIGHT = 0.2
+    LABEL_SMOOTH = 0.05
+    CLS_RAMP_EPOCHS = 5
+
+    # Accuracy boosters
+    CORR_LOSS_WEIGHT = 0.05
+    USE_EMA = True
+    EMA_DECAY = 0.999
+
+    # Reinforcement Learning modes
+    RL_TRADING_ENABLED = False
+    class FeatureEngineer:
+        @staticmethod
+        def engineer(df: pd.DataFrame) -> pd.DataFrame:
+            d = df.copy()
+            # Core indicators
+            d['SMA_20'] = talib.SMA(d['close'], timeperiod=20)
+            d['EMA_50'] = talib.EMA(d['close'], timeperiod=50)
+            d['RSI'] = talib.RSI(d['close'], timeperiod=14)
+            macd, macds, macdh = talib.MACD(d['close'], 12, 26, 9)
+            d['MACD'] = macd
+            d['MACD_Signal'] = macds
+            d['MACD_Hist'] = macdh
+            upper, middle, lower = talib.BBANDS(d['close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+            d['BB_Upper'] = upper
+            d['BB_Lower'] = lower
+            width = upper - lower
+            d['BB_Width'] = width
+            with np.errstate(divide='ignore', invalid='ignore'):
+                pos = (d['close'] - lower) / width
+            d['BB_Position'] = pos.clip(0, 1)
+            d['ATR'] = talib.ATR(d['high'], d['low'], d['close'], timeperiod=14)
+            d['OBV'] = talib.OBV(d['close'], d['volume'])
+            d['HL_Ratio'] = d['high'] / d['low']
+            d['Price_Change'] = d['close'].pct_change()
+            d['Volume_Change'] = d['volume'].pct_change()
+
+            # Additional returns/volatility
+            d['Return_5m'] = d['close'].pct_change(5)
+            d['Return_15m'] = d['close'].pct_change(15)
+            d['Volatility_30m'] = d['Price_Change'].rolling(30).std()
+
+            # Extra engineered features
+            d['Log_Volume'] = np.log1p(d['volume'])
+            d['Range'] = (d['high'] - d['low']) / d['close']
+            d['Close_to_Open'] = (d['close'] - d['open']) / d['open']
+            d['Keltner'] = talib.EMA(d['close'], timeperiod=20) - talib.ATR(d['high'], d['low'], d['close'], timeperiod=20)
+            d['ZScore_Close_100'] = (d['close'] - d['close'].rolling(100).mean()) / (d['close'].rolling(100).std() + 1e-9)
+            d['RSI_7'] = talib.RSI(d['close'], timeperiod=7)
+            d['RSI_28'] = talib.RSI(d['close'], timeperiod=28)
+
+            # Time-of-day cyclic features (UTC)
+            minute = d.index.minute.astype(float)
+            hour = d.index.hour.astype(float)
+            dow = d.index.dayofweek.astype(float)
+            d['sin_hour'] = np.sin(2 * np.pi * hour / 24)
+            d['cos_hour'] = np.cos(2 * np.pi * hour / 24)
+            d['sin_min'] = np.sin(2 * np.pi * minute / 60)
+            d['cos_min'] = np.cos(2 * np.pi * minute / 60)
+            d['sin_dow'] = np.sin(2 * np.pi * dow / 7)
+            d['cos_dow'] = np.cos(2 * np.pi * dow / 7)
+
+            # Target: next-step log return
+            d['target'] = np.log(d['close']).diff().shift(-1)
+            d.replace([np.inf, -np.inf], np.nan, inplace=True)
+            d.dropna(inplace=True)
+            return d
+
+        @staticmethod
+        def merge_sentiment(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+            if not getattr(cfg, 'SENTIMENT_CSV', None):
+                return df
+            try:
+                s = pd.read_csv(cfg.SENTIMENT_CSV)
+                ts_col = getattr(cfg, 'SENTIMENT_TIMESTAMP_COL', 'timestamp')
+                s[ts_col] = pd.to_datetime(s[ts_col], utc=True)
+                s.set_index(ts_col, inplace=True)
+                # forward-fill to minute frequency
+                s = s.resample('1min').ffill()
+                cols = getattr(cfg, 'SENTIMENT_VALUE_COLS', ['sentiment'])
+                df = df.join(s[cols], how='left').fillna(method='ffill')
+            except Exception as e:
+                logger.warning(f"Sentiment merge failed: {e}")
+            return df
+    # External sentiment merge (optional)
+    SENTIMENT_CSV = None            # e.g., 'sentiment.csv' with UTC timestamp and a score column
+    SENTIMENT_TIMESTAMP_COL = 'timestamp'
+    SENTIMENT_VALUE_COLS = ['sentiment']
+
+    # Data augmentation (training only)
+    AUG_NOISE_STD = 0.0             # e.g., 0.01 adds small Gaussian noise
+    TIME_MASK_RATIO = 0.0           # fraction of timesteps randomly zeroed per sample (0.0-0.5)
+
+    # Stochastic Weight Averaging (optional)
+    USE_SWA = False
+    SWA_START_EPOCH = 9999          # set e.g. to int(0.7*EPOCHS)
+    SWA_UPDATE_FREQ = 1             # update every n optimizer steps when >= start epoch
+    SWA_PREFER_EMA = True           # if both EMA and SWA enabled, prefer EMA for validation/inference
+
+    # Test-time dropout ensembling
+    TTA_DROPOUT_PASSES = 0          # >0 to enable MC dropout averaging in walk-forward
+
+    # Logging/early-stop tweaks
+    MIN_IMPROVE_DELTA = 1e-6        # minimum improvement to update best and save checkpoint
+    LOG_GRAD_N_STEPS = 0            # e.g., 200 to log grad-norm periodically; 0 disables
+
+    # Reinforcement Learning modes (prediction/trading) and params
+    RL_TRADING_ENABLED = False
+    RL_PREDICT_ENABLED = True
+    RL_EPISODES = 3
+    RL_BUFFER_SIZE = 100_000
+    RL_BATCH_SIZE = 256
+    RL_GAMMA = 0.99
+    RL_LR = 1e-3
+    RL_EPS_START = 1.0
+    RL_EPS_END = 0.05
+    RL_EPS_DECAY = 20_000
+    RL_TAU = 0.005
+    RL_PRED_N_BINS = 41
+    TRANSACTION_COST_BPS = 1.0
+
+    # Walk-forward controls
+    RETRAIN_FREQUENCY = 100
+    WALK_FORWARD_MAX_STEPS = 1000
+    # Safer, quicker retrain defaults
+    RETRAIN_EPOCHS = 5
+    MIN_EPOCHS = 25
+    RETRAIN_LR_MULT = 0.05         # much smaller LR for small windows
+    EARLY_STOP_PATIENCE = 10
+    RETRAIN_WINDOW_MIN = 5000
+    RETRAIN_STRIDE = 1             # denser windows for retrain
+    RETRAIN_VAL_SPLIT = 0.2        # larger val slice to detect overfit
+    RETRAIN_SCHEDULER = 'plateau'  # override to a safe scheduler
+    RETRAIN_HEAD_ONLY = True       # freeze base; train heads/proj only
+    RETRAIN_REVERT_ON_DEGRADE = True
+
+    # Acceleration
+    USE_GPU = True
+    MIXED_PRECISION = True
+    USE_TORCH_COMPILE = True
+    TORCH_COMPILE_BACKEND = 'inductor'
+    TORCH_COMPILE_MODE = 'max-autotune'
+    TORCH_COMPILE_DYNAMIC = True
+
+    # Artifacts / checkpoints
+    FINAL_MODEL_PATH = 'final_model_pytorch.pt'
+    SCALER_X_PATH = 'scaler_x_pytorch.pkl'
+    SCALER_Y_PATH = 'scaler_y_pytorch.pkl'
+    RL_POLICY_PATH = 'rl_policy_dqn.pt'
+    SAVE_CHECKPOINTS = True
+    CHECKPOINT_BEST_PATH = 'checkpoint_best.pt'
+    CHECKPOINT_LAST_PATH = 'checkpoint_last.pt'
+
+    # Microstructure (L2 and trades) collection
+    MICROSTRUCTURE_ENABLED = True
+    MICROSTRUCTURE_FILE = 'microstructure_features.csv'   # CSV with UTC timestamp index
+    ORDER_BOOK_LEVELS = 20
+    ORDER_BOOK_SPEED_MS = 100
+    LARGE_ORDER_USD = 100_000.0
+    LARGE_TRADE_USD = 100_000.0
+    DEPTH_TOP_N = 10
+
+    # Memory / dataloader
+    MAX_BARS = 2_000_000
+    NUM_WORKERS = 2
+    PIN_MEMORY = True
+    PREFETCH_FACTOR = 2
+    PERSISTENT_WORKERS = True
+    NON_BLOCKING = True
+
+    # Throughput controls
+    WINDOW_STRIDE = 5
+    MAX_TRAIN_WINDOWS = 300_000
+    MAX_VAL_WINDOWS = 50_000
+
+    # Scheduler
+    SCHEDULER = 'onecycle'   # 'plateau' | 'onecycle' | 'cosine'
+    ONECYCLE_MAX_LR = 5e-3
+    COSINE_MIN_LR = 1e-6
+    WARMUP_EPOCHS = 0
+
+    # Validation split controls
+    VALIDATION_SPLIT_MODE = 'chronological'
+    WINDOW_VAL_GAP_MULT = 1.0
+
+    # TensorBoard
+    TENSORBOARD_ENABLED = False
+    TB_LOG_DIR = 'runs/btc_prediction'
+
+    # Cross-validation
+    RUN_CV = False
+    CV_N_SPLITS = 3
+    CV_TEST_SIZE = 0.1
+    EPOCHS_CV = 10
+
+
+class DataFetcher:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.client = None
+        try:
+            self.client = Client(api_key=cfg.API_KEY, api_secret=cfg.API_SECRET)
+        except TypeError:
+            # Fallback for older signatures
+            self.client = Client(cfg.API_KEY, cfg.API_SECRET)
+
+    @staticmethod
+    def _to_ms(ts: str) -> int:
+        return int(pd.Timestamp(ts, tz='UTC').timestamp() * 1000)
+
+    def _fetch_page(self, start_ms: int, limit: int = 1000) -> List[List]:
+        return self.client.klines(symbol=self.cfg.SYMBOL, interval=self.cfg.INTERVAL, startTime=start_ms, limit=limit)
+
+    @staticmethod
+    def _process_klines(klines: List[List]) -> pd.DataFrame:
+        df = pd.DataFrame(klines, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        df['timestamp'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+        df.set_index('timestamp', inplace=True)
+        num_cols = ['open', 'high', 'low', 'close', 'volume']
+        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce').astype('float32')
+        return df[num_cols].dropna()
+
+    def fetch_and_cache(self) -> pd.DataFrame:
+        cached = None
+        if os.path.exists(self.cfg.CACHE_FILE):
+            try:
+                cached = pd.read_parquet(self.cfg.CACHE_FILE)
+                logger.info(f"Loaded cache: {self.cfg.CACHE_FILE} ({len(cached)} rows)")
+            except Exception as e:
+                logger.warning(f"Cache read failed: {e}; refetching.")
+
+        if self.client is None:
+            if cached is not None:
+                return cached
+            raise RuntimeError("Binance client not initialized (missing API credentials)")
+
+        pages: List[pd.DataFrame] = []
+        if cached is not None and not cached.empty:
+            start_ms = int(cached.index[-1].timestamp() * 1000) + 1
+            pages.append(cached)
+            logger.info(f"Resuming from {cached.index[-1]}")
+        else:
+            start_ms = self._to_ms(self.cfg.DATA_START_DATE)
+
+        max_now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        while start_ms < max_now_ms:
+            kl = self._fetch_page(start_ms)
+            if not kl:
+                break
+            df_page = self._process_klines(kl)
+            if df_page.empty:
+                break
+            pages.append(df_page)
+            last_close_ms = kl[-1][6]
+            start_ms = int(last_close_ms) + 1
+            time.sleep(0.2)
+            if len(pages) > 2000:
+                logger.warning("Stopping fetch early to avoid excessive runtime.")
+                break
+
+        data = pd.concat(pages).sort_index().loc[:, ['open', 'high', 'low', 'close', 'volume']]
+        data = data[~data.index.duplicated(keep='last')]
+        data.to_parquet(self.cfg.CACHE_FILE)
+        logger.info(f"Cached -> {self.cfg.CACHE_FILE} ({len(data)} rows)")
+        return data
+
+
+class FeatureEngineer:
+    @staticmethod
+    def engineer(df: pd.DataFrame) -> pd.DataFrame:
+        d = df.copy()
+        # Core indicators
+        d['SMA_20'] = talib.SMA(d['close'], timeperiod=20)
+        d['EMA_50'] = talib.EMA(d['close'], timeperiod=50)
+        d['RSI'] = talib.RSI(d['close'], timeperiod=14)
+        macd, macds, macdh = talib.MACD(d['close'], 12, 26, 9)
+        d['MACD'] = macd
+        d['MACD_Signal'] = macds
+        d['MACD_Hist'] = macdh
+        upper, middle, lower = talib.BBANDS(d['close'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+        d['BB_Upper'] = upper
+        d['BB_Lower'] = lower
+        width = upper - lower
+        d['BB_Width'] = width
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pos = (d['close'] - lower) / width
+        d['BB_Position'] = pos.clip(0, 1)
+        d['ATR'] = talib.ATR(d['high'], d['low'], d['close'], timeperiod=14)
+        d['OBV'] = talib.OBV(d['close'], d['volume'])
+        d['HL_Ratio'] = d['high'] / d['low']
+        d['Price_Change'] = d['close'].pct_change()
+        d['Volume_Change'] = d['volume'].pct_change()
+
+        # Additional returns/volatility
+        d['Return_5m'] = d['close'].pct_change(5)
+        d['Return_15m'] = d['close'].pct_change(15)
+        d['Volatility_30m'] = d['Price_Change'].rolling(30).std()
+
+        # Extra engineered features
+        d['Log_Volume'] = np.log1p(d['volume'])
+        d['Range'] = (d['high'] - d['low']) / d['close']
+        d['Close_to_Open'] = (d['close'] - d['open']) / d['open']
+        d['Keltner'] = talib.EMA(d['close'], timeperiod=20) - talib.ATR(d['high'], d['low'], d['close'], timeperiod=20)
+        d['ZScore_Close_100'] = (d['close'] - d['close'].rolling(100).mean()) / (d['close'].rolling(100).std() + 1e-9)
+        d['RSI_7'] = talib.RSI(d['close'], timeperiod=7)
+        d['RSI_28'] = talib.RSI(d['close'], timeperiod=28)
+
+        # Time-of-day cyclic features (UTC)
+        minute = d.index.minute.astype(float)
+        hour = d.index.hour.astype(float)
+        dow = d.index.dayofweek.astype(float)
+        d['sin_hour'] = np.sin(2 * np.pi * hour / 24)
+        d['cos_hour'] = np.cos(2 * np.pi * hour / 24)
+        d['sin_min'] = np.sin(2 * np.pi * minute / 60)
+        d['cos_min'] = np.cos(2 * np.pi * minute / 60)
+        d['sin_dow'] = np.sin(2 * np.pi * dow / 7)
+        d['cos_dow'] = np.cos(2 * np.pi * dow / 7)
+
+        # Target: next-step log return
+        d['target'] = np.log(d['close']).diff().shift(-1)
+        d.replace([np.inf, -np.inf], np.nan, inplace=True)
+        d.dropna(inplace=True)
+        return d
+
+    @staticmethod
+    def merge_sentiment(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+        if not getattr(cfg, 'SENTIMENT_CSV', None):
+            return df
+        try:
+            s = pd.read_csv(cfg.SENTIMENT_CSV)
+            ts_col = getattr(cfg, 'SENTIMENT_TIMESTAMP_COL', 'timestamp')
+            s[ts_col] = pd.to_datetime(s[ts_col], utc=True)
+            s.set_index(ts_col, inplace=True)
+            # forward-fill to minute frequency
+            s = s.resample('1min').ffill()
+            cols = getattr(cfg, 'SENTIMENT_VALUE_COLS', ['sentiment'])
+            df = df.join(s[cols], how='left').fillna(method='ffill')
+        except Exception as e:
+            logger.warning(f"Sentiment merge failed: {e}")
+        return df
+
+    @staticmethod
+    def merge_microstructure(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+        path = getattr(cfg, 'MICROSTRUCTURE_FILE', None)
+        if not path or not os.path.exists(path):
+            return df
+        try:
+            ms = pd.read_csv(path)
+            # Expect a 'timestamp' column in ISO; convert to UTC and set as index
+            if 'timestamp' in ms.columns:
+                ms['timestamp'] = pd.to_datetime(ms['timestamp'], utc=True)
+                ms.set_index('timestamp', inplace=True)
+            else:
+                # If first column is unnamed timestamp
+                ms.index = pd.to_datetime(ms.iloc[:, 0], utc=True)
+                ms = ms.iloc[:, 1:]
+            # Resample to 1-minute bins and forward fill within gaps
+            ms = ms.resample('1min').ffill()
+            # If VWAP column present, compute deviation vs close during merge later
+            out = df.join(ms, how='left')
+            # Compute vwap deviation if both present
+            if 'vwap' in out.columns:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    out['vwap_dev'] = (out['close'] - out['vwap']) / (out['vwap'].replace(0, np.nan))
+            return out
+        except Exception as e:
+            logger.warning(f"Microstructure merge failed: {e}")
+            return df
+
+
+# ---------------------
+# Microstructure streaming (optional)
+# ---------------------
+class MicrostructureAggregator:
+    """Aggregates depth and trades into 1-minute microstructure features."""
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.reset_minute()
+        self.rows: list[dict] = []
+
+    def reset_minute(self):
+        self.minute = None
+        # Depth snapshot metrics (last seen in minute)
+        self.spread = np.nan
+        self.imbalance = np.nan
+        self.depth_ratio = np.nan
+        self.order_cluster = np.nan
+        self.large_orders = 0
+        # Trades accumulators
+        self.buy_vol = 0.0
+        self.sell_vol = 0.0
+        self.large_trades = 0
+        self.trade_count = 0
+        self.vwap_num = 0.0
+        self.vwap_den = 0.0
+
+    def _minute_of(self, ts: pd.Timestamp) -> pd.Timestamp:
+        return ts.floor('T')
+
+    def _flush_if_new_minute(self, now: pd.Timestamp):
+        m = self._minute_of(now)
+        if self.minute is None:
+            self.minute = m
+            return
+        if m > self.minute:
+            # finalize row for previous minute
+            vwap = (self.vwap_num / self.vwap_den) if self.vwap_den > 0 else np.nan
+            self.rows.append({
+                'timestamp': self.minute.tz_convert('UTC') if self.minute.tzinfo else self.minute.tz_localize('UTC'),
+                'bid_ask_spread': self.spread,
+                'book_imbalance': self.imbalance,
+                'depth_ratio': self.depth_ratio,
+                'order_clustering': self.order_cluster,
+                'large_orders': float(self.large_orders),
+                'buy_volume': float(self.buy_vol),
+                'sell_volume': float(self.sell_vol),
+                'large_trades': float(self.large_trades),
+                'trade_intensity': float(self.trade_count) / 60.0,
+                'vwap': vwap,
+            })
+            # reset for new minute
+            self.reset_minute()
+            self.minute = m
+
+    def on_depth(self, bids: list[list[str]], asks: list[list[str]], event_time_ms: int):
+        # bids/asks: [[price, qty], ...] strings
+        now = pd.to_datetime(event_time_ms, unit='ms', utc=True)
+        self._flush_if_new_minute(now)
+        try:
+            levels = int(self.cfg.ORDER_BOOK_LEVELS)
+            top_bids = [(float(p), float(q)) for p, q in bids[:levels] if float(q) > 0]
+            top_asks = [(float(p), float(q)) for p, q in asks[:levels] if float(q) > 0]
+            if not top_bids or not top_asks:
+                return
+            best_bid = top_bids[0][0]
+            best_ask = top_asks[0][0]
+            mid = 0.5 * (best_bid + best_ask)
+            self.spread = (best_ask - best_bid) / max(mid, 1e-9)
+            n = int(self.cfg.DEPTH_TOP_N)
+            sb = sum(q for _, q in top_bids[:n])
+            sa = sum(q for _, q in top_asks[:n])
+            tot = sb + sa
+            self.imbalance = ((sb - sa) / tot) if tot > 0 else np.nan
+            self.depth_ratio = (sb / sa) if sa > 0 else np.inf
+            # large orders count in USD using mid
+            thr = float(self.cfg.LARGE_ORDER_USD)
+            self.large_orders += sum(1 for p, q in (top_bids[:n] + top_asks[:n]) if (p * q) * 1.0 >= thr)
+            # simple clustering: Herfindahl-like concentration of qty over price levels
+            sizes = np.array([q for _, q in (top_bids[:n] + top_asks[:n])], dtype=np.float64)
+            s = sizes.sum()
+            self.order_cluster = float((np.sum((sizes / s) ** 2) if s > 0 else np.nan))
+        except Exception:
+            pass
+
+    def on_trade(self, price: float, qty: float, is_buyer_maker: bool, event_time_ms: int):
+        # is_buyer_maker True => buyer is maker => sell aggressor
+        now = pd.to_datetime(event_time_ms, unit='ms', utc=True)
+        self._flush_if_new_minute(now)
+        usd = price * qty
+        if is_buyer_maker:
+            # seller-initiated trade
+            self.sell_vol += qty
+        else:
+            self.buy_vol += qty
+        self.trade_count += 1
+        self.vwap_num += price * qty
+        self.vwap_den += qty
+        if usd >= float(self.cfg.LARGE_TRADE_USD):
+            self.large_trades += 1
+
+    def dump_to_csv(self, path: str):
+        if not self.rows:
+            return
+        df = pd.DataFrame(self.rows)
+        df.set_index('timestamp', inplace=True)
+        # append or write
+        if os.path.exists(path):
+            try:
+                prev = pd.read_csv(path)
+                if 'timestamp' in prev.columns:
+                    prev['timestamp'] = pd.to_datetime(prev['timestamp'], utc=True)
+                    prev.set_index('timestamp', inplace=True)
+                df = pd.concat([prev, df]).sort_index().loc[~df.index.duplicated(keep='last')]
+            except Exception:
+                pass
+        df.to_csv(path)
+        self.rows.clear()
+
+
+def start_microstructure_stream(cfg: Config):
+    if SpotWebsocketStreamClient is None:
+        raise RuntimeError("binance-connector websocket client not available. Install binance-connector>=3.x")
+    agg = MicrostructureAggregator(cfg)
+    client = SpotWebsocketStreamClient()
+
+    def depth_cb(msg):
+        try:
+            # message fields vary; handle both snapshot and updates
+            bids = msg.get('bids') or msg.get('b', [])
+            asks = msg.get('asks') or msg.get('a', [])
+            et = msg.get('E') or msg.get('T') or int(pd.Timestamp.utcnow().timestamp() * 1000)
+            agg.on_depth(bids, asks, int(et))
+        except Exception:
+            pass
+
+    def trade_cb(msg):
+        try:
+            price = float(msg['p'])
+            qty = float(msg['q'])
+            is_bm = bool(msg['m'])
+            et = msg.get('E') or msg.get('T') or int(pd.Timestamp.utcnow().timestamp() * 1000)
+            agg.on_trade(price, qty, is_bm, int(et))
+        except Exception:
+            pass
+
+    # Subscribe
+    client.partial_book_depth(
+        symbol=Config.SYMBOL,
+        level=int(cfg.ORDER_BOOK_LEVELS),
+        speed=int(cfg.ORDER_BOOK_SPEED_MS),
+        callback=depth_cb,
+    )
+    client.agg_trade(symbol=Config.SYMBOL.lower(), id=1, callback=trade_cb)
+
+    logger.info("Microstructure stream started (Ctrl+C to stop)...")
+    try:
+        while True:
+            time.sleep(5)
+            # periodic flush
+            agg.dump_to_csv(cfg.MICROSTRUCTURE_FILE)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            agg.dump_to_csv(cfg.MICROSTRUCTURE_FILE)
+        except Exception:
+            pass
+        try:
+            client.stop()
+        except Exception:
+            pass
+
+
+class WindowDataset(Dataset):
+    """Lazy window dataset with stride to reduce redundancy."""
+    def __init__(self, scaled: np.ndarray, n_steps: int, stride: int = 1):
+        self.scaled = scaled.astype(np.float32, copy=False)  # [T, F]
+        self.n_steps = int(n_steps)
+        self.stride = max(1, int(stride))
+
+    def __len__(self):
+        n = self.scaled.shape[0] - self.n_steps
+        if n <= 0:
+            return 0
+        return 1 + (n - 1) // self.stride
+
+    def __getitem__(self, idx):
+        base = idx * self.stride
+        x = self.scaled[base:base + self.n_steps, :-1]
+        y = self.scaled[base + self.n_steps, -1]
+        return torch.from_numpy(x), torch.tensor([y], dtype=torch.float32)
+
+
+class LSTMRegressor(nn.Module):
+    def __init__(self, n_features: int, hidden: int = 64, layers: int = 1, dropout: float = 0.2, multitask: bool = False):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=n_features, hidden_size=hidden, num_layers=layers, batch_first=True, dropout=dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+        self.multitask = multitask
+        if self.multitask:
+            self.head_cls = nn.Linear(hidden, 1)  # classification logit
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        last = out[:, -1, :]
+        reg = self.head(last)
+        if self.multitask:
+            cls_logit = self.head_cls(last)
+            return reg, cls_logit
+        return reg
+
+
+class PositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding for Transformer inputs."""
+    def __init__(self, d_model: int, max_len: int = 10000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(1))  # [max_len, 1, d_model]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [T, B, d_model]
+        T = x.size(0)
+        return x + self.pe[:T]
+
+
+class HybridLSTMTransformerRegressor(nn.Module):
+    """Hybrid model: LSTM feature extractor + Transformer encoder + MLP head."""
+    def __init__(self, n_features: int, cfg: Config):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=cfg.LSTM_HIDDEN,
+            num_layers=cfg.LSTM_LAYERS,
+            batch_first=True,
+            dropout=cfg.LSTM_DROPOUT if cfg.LSTM_LAYERS > 1 else 0.0,
+        )
+        self.proj = nn.Linear(cfg.LSTM_HIDDEN, cfg.TR_D_MODEL)
+        self.pre_ln = nn.LayerNorm(cfg.TR_D_MODEL)
+        self.seq_dropout = nn.Dropout(0.1)
+        ff_dim = int(round(cfg.TR_D_MODEL * getattr(cfg, 'TR_FF_MULT', 4.0)))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.TR_D_MODEL,
+            nhead=cfg.TR_NHEAD,
+            dim_feedforward=ff_dim,
+            dropout=cfg.TR_DROPOUT,
+            batch_first=False,
+            activation='gelu',
+            norm_first=True,
+        )
+        self.posenc = PositionalEncoding(cfg.TR_D_MODEL)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.TR_LAYERS)
+        self.head = nn.Sequential(
+            nn.Linear(cfg.TR_D_MODEL, cfg.HEAD_HIDDEN),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+            nn.Linear(cfg.HEAD_HIDDEN, 1),
+        )
+        self.multitask = cfg.MULTITASK
+        if self.multitask:
+            self.head_cls = nn.Sequential(
+                nn.Dropout(0.2),
+                nn.Linear(cfg.TR_D_MODEL, 1)
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        seq, _ = self.lstm(x)              # [B, T, H]
+        h = self.proj(seq)                  # [B, T, D]
+        h = h.transpose(0, 1)               # [T, B, D]
+        h = self.posenc(h)                  # add positional encoding
+        h = self.pre_ln(h)
+        h = self.encoder(h)                 # [T, B, D]
+        h = self.seq_dropout(h)
+        last = h[-1]                        # [B, D]
+        reg = self.head(last)
+        if self.multitask:
+            cls_logit = self.head_cls(last)
+            return reg, cls_logit
+        return reg
+
+
+# ---------------------
+# RL components
+# ---------------------
+"""
+We support two RL modes:
+1) Trading DQN (policy over actions {-1,0,1}).
+2) Predictor DQN (no trading): directly predicts next scaled return via discrete bins; reward = - (error^2).
+"""
+
+# ===== RL Predictor (no trading decisions) =====
+class PredictionEnv:
+    """Env that uses scaled features and target to predict next scaled return.
+    Observation: concat last k windows of feature means and last k targets (scaled).
+    Action: discrete bin index representing a predicted scaled return value.
+    Reward: negative squared error between bin center and actual next scaled return.
+    """
+    def __init__(self, scaled: np.ndarray, k: int = 10, n_bins: int = 41):
+        # scaled: [T, F] with last column the scaled target
+        assert scaled.ndim == 2
+        self.scaled = scaled.astype(np.float32)
+        self.k = k
+        self.n_bins = int(n_bins)
+        # Build bin centers in approximately [-2.0, 2.0]
+        self.bin_centers = np.linspace(-2.0, 2.0, self.n_bins, dtype=np.float32)
+        # Precompute per-step simple state: mean over features for compactness
+        self.feat = self.scaled[:, :-1]
+        self.tgt = self.scaled[:, -1]
+        self.sig = self.feat.mean(axis=1)
+        self.reset()
+
+    @property
+    def state_dim(self) -> int:
+        return self.k * 2  # last k of sig and last k of target
+
+    @property
+    def action_dim(self) -> int:
+        return self.n_bins
+
+    def reset(self):
+        self.t = self.k
+        return np.concatenate([self.sig[self.t-self.k:self.t], self.tgt[self.t-self.k:self.t]]).astype(np.float32)
+
+    def step(self, action_idx: int):
+        a = int(np.clip(action_idx, 0, self.n_bins - 1))
+        pred = self.bin_centers[a]
+        y = float(self.tgt[self.t])
+        # reward = - squared error
+        reward = - (pred - y) ** 2
+        self.t += 1
+        done = self.t >= len(self.tgt)
+        if not done:
+            s = np.concatenate([self.sig[self.t-self.k:self.t], self.tgt[self.t-self.k:self.t]]).astype(np.float32)
+        else:
+            s = None
+        return s, reward, done, y, pred
+
+
+class PredictorDQN(nn.Module):
+    def __init__(self, state_dim: int, hidden: int, action_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, action_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_rl_predictor(cfg: Config, df_train: pd.DataFrame, scaler_x: RobustScaler, scaler_y: StandardScaler, n_steps: int, device: torch.device) -> PredictorDQN:
+    # Build scaled windowed matrix from train for env
+    X = df_train.drop(columns=['target'])
+    y = df_train[['target']]
+    Xs = scaler_x.transform(X).astype(np.float32, copy=False)
+    ys = scaler_y.transform(y).astype(np.float32, copy=False)
+    scaled = np.concatenate([Xs, ys], axis=1)
+    # Use a compact env that looks back over simple summaries
+    k = 10
+    env = PredictionEnv(scaled, k=k, n_bins=cfg.RL_PRED_N_BINS)
+    policy = PredictorDQN(state_dim=env.state_dim, hidden=128, action_dim=env.action_dim).to(device)
+    target = PredictorDQN(state_dim=env.state_dim, hidden=128, action_dim=env.action_dim).to(device)
+    target.load_state_dict(policy.state_dict())
+    opt = Adam(policy.parameters(), lr=cfg.RL_LR)
+    buf = ReplayBuffer(cfg.RL_BUFFER_SIZE, env.state_dim)
+
+    steps = 0
+    eps = cfg.RL_EPS_START
+    eps_decay = cfg.RL_EPS_DECAY
+    gamma = cfg.RL_GAMMA
+    tau = cfg.RL_TAU
+
+    def select_action(state_vec):
+        nonlocal eps, steps
+        steps += 1
+        eps = max(cfg.RL_EPS_END, cfg.RL_EPS_START - steps / eps_decay)
+        if np.random.rand() < eps:
+            return np.random.randint(env.action_dim)
+        with torch.no_grad():
+            q = policy(torch.from_numpy(state_vec).to(device).float().unsqueeze(0))
+            return int(q.argmax(dim=1).item())
+
+    for ep in range(cfg.RL_EPISODES):
+        s = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            a = select_action(s)
+            s2, r, done, _, _ = env.step(a)
+            buf.push(s, a, r, float(done), s2 if s2 is not None else np.zeros_like(s))
+            s = s2 if s2 is not None else s
+            ep_ret += r
+            if buf.size >= cfg.RL_BATCH_SIZE:
+                sb, ab, rb, db, s2b = buf.sample(cfg.RL_BATCH_SIZE)
+                sb = sb.to(device)
+                ab = ab.to(device)
+                rb = rb.to(device)
+                db = db.to(device)
+                s2b = s2b.to(device)
+                q = policy(sb).gather(1, ab.view(-1,1)).squeeze(1)
+                with torch.no_grad():
+                    next_q = target(s2b).max(dim=1)[0]
+                    target_q = rb + (1.0 - db) * gamma * next_q
+                loss = nn.MSELoss()(q, target_q)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                opt.step()
+                with torch.no_grad():
+                    for tp, pp in zip(target.parameters(), policy.parameters()):
+                        tp.data.lerp_(pp.data, tau)
+        logger.info(f"RL-Predict episode {ep+1}/{cfg.RL_EPISODES} return={ep_ret:.6f} eps={eps:.3f}")
+
+    return policy
+
+
+def eval_rl_predictor(policy: PredictorDQN, df_test: pd.DataFrame, scaler_x: RobustScaler, scaler_y: StandardScaler, device: torch.device, n_bins: int) -> tuple[np.ndarray, np.ndarray]:
+    X = df_test.drop(columns=['target'])
+    y = df_test[['target']]
+    Xs = scaler_x.transform(X).astype(np.float32, copy=False)
+    ys = scaler_y.transform(y).astype(np.float32, copy=False)
+    scaled = np.concatenate([Xs, ys], axis=1)
+    env = PredictionEnv(scaled, k=10, n_bins=n_bins)
+    s = env.reset()
+    preds_scaled = []
+    actuals_scaled = []
+    done = False
+    while not done:
+        with torch.no_grad():
+            q = policy(torch.from_numpy(s).to(device).float().unsqueeze(0))
+            a = int(q.argmax(dim=1).item())
+        s, _, done, y, p = env.step(a)
+        preds_scaled.append(p)
+        actuals_scaled.append(y)
+    return np.array(preds_scaled, dtype=np.float32), np.array(actuals_scaled, dtype=np.float32)
+
+
+# ===== RL Trading (policy) =====
+class TradingEnv:
+    """Simple episodic env over test set: actions {-1, 0, +1} with transaction costs.
+    State: concat last k returns and last k predictions.
+    Reward: position * next raw return - cost when position changes.
+    """
+    def __init__(self, returns: np.ndarray, preds: np.ndarray, k: int = 10, cost_bps: float = 1.0):
+        assert len(returns) == len(preds)
+        self.r = returns.astype(np.float32)
+        self.p = preds.astype(np.float32)
+        self.k = k
+        self.cost = cost_bps / 10000.0
+        self.reset()
+
+    def reset(self):
+        self.t = self.k
+        self.pos = 0  # -1,0,1
+        s = np.concatenate([self.r[self.t-self.k:self.t], self.p[self.t-self.k:self.t]])
+        return s
+
+    def step(self, action: int):
+        action = int(np.clip(action, -1, 1))
+        prev_pos = self.pos
+        self.pos = action
+        # transaction cost if position changes
+        traded = float(prev_pos != self.pos)
+        ret = self.r[self.t]
+        reward = float(self.pos) * float(ret) - traded * self.cost
+        self.t += 1
+        done = self.t >= len(self.r)
+        if not done:
+            s = np.concatenate([self.r[self.t-self.k:self.t], self.p[self.t-self.k:self.t]])
+        else:
+            s = None
+        return s, reward, done
+
+
+class DQN(nn.Module):
+    def __init__(self, state_dim: int, hidden: int = 128, action_dim: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, action_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int, state_dim: int):
+        self.cap = capacity
+        self.ptr = 0
+        self.size = 0
+        self.s = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.a = np.zeros((capacity,), dtype=np.int64)
+        self.r = np.zeros((capacity,), dtype=np.float32)
+        self.d = np.zeros((capacity,), dtype=np.float32)
+        self.s2 = np.zeros((capacity, state_dim), dtype=np.float32)
+    def push(self, s, a, r, d, s2):
+        i = self.ptr % self.cap
+        self.s[i] = s
+        self.a[i] = a
+        self.r[i] = r
+        self.d[i] = d
+        if s2 is not None:
+            self.s2[i] = s2
+        self.ptr += 1
+        self.size = min(self.size + 1, self.cap)
+    def sample(self, batch: int):
+        idx = np.random.randint(0, self.size, size=batch)
+        return (
+            torch.from_numpy(self.s[idx]),
+            torch.from_numpy(self.a[idx]),
+            torch.from_numpy(self.r[idx]),
+            torch.from_numpy(self.d[idx]),
+            torch.from_numpy(self.s2[idx]),
+        )
+
+
+def train_dqn(cfg: Config, returns: np.ndarray, preds: np.ndarray, device: torch.device) -> DQN:
+    k = 10
+    env = TradingEnv(returns, preds, k=k, cost_bps=cfg.TRANSACTION_COST_BPS)
+    state_dim = k * 2
+    action_dim = 3  # {-1,0,1}
+    policy = DQN(state_dim, hidden=128, action_dim=action_dim).to(device)
+    target = DQN(state_dim, hidden=128, action_dim=action_dim).to(device)
+    target.load_state_dict(policy.state_dict())
+    opt = Adam(policy.parameters(), lr=cfg.RL_LR)
+    buf = ReplayBuffer(cfg.RL_BUFFER_SIZE, state_dim)
+
+    steps = 0
+    eps = cfg.RL_EPS_START
+    eps_decay = cfg.RL_EPS_DECAY
+    gamma = cfg.RL_GAMMA
+    tau = cfg.RL_TAU
+
+    def select_action(state_vec):
+        nonlocal eps, steps
+        steps += 1
+        eps = max(cfg.RL_EPS_END, cfg.RL_EPS_START - steps / eps_decay)
+        if np.random.rand() < eps:
+            return np.random.choice([-1, 0, 1])
+        with torch.no_grad():
+            q = policy(torch.from_numpy(state_vec).to(device).float().unsqueeze(0))
+            a_idx = int(q.argmax(dim=1).item())
+        return [-1, 0, 1][a_idx]
+
+    for ep in range(cfg.RL_EPISODES):
+        s = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            a = select_action(s)
+            s2, r, done = env.step(a)
+            buf.push(s, [ -1,0,1 ].index(a), r, float(done), s2 if s2 is not None else np.zeros_like(s))
+            s = s2 if s2 is not None else s
+            ep_ret += r
+            # learn
+            if buf.size >= cfg.RL_BATCH_SIZE:
+                sb, ab, rb, db, s2b = buf.sample(cfg.RL_BATCH_SIZE)
+                sb = sb.to(device)
+                ab = ab.to(device)
+                rb = rb.to(device)
+                db = db.to(device)
+                s2b = s2b.to(device)
+                q = policy(sb).gather(1, ab.view(-1,1)).squeeze(1)
+                with torch.no_grad():
+                    next_q = target(s2b).max(dim=1)[0]
+                    target_q = rb + (1.0 - db) * gamma * next_q
+                loss = nn.MSELoss()(q, target_q)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                opt.step()
+                # soft update
+                with torch.no_grad():
+                    for tp, pp in zip(target.parameters(), policy.parameters()):
+                        tp.data.lerp_(pp.data, tau)
+        logger.info(f"RL episode {ep+1}/{cfg.RL_EPISODES} return={ep_ret:.6f} eps={eps:.3f}")
+
+    return policy
+
+
+def eval_dqn(policy: DQN, returns: np.ndarray, preds: np.ndarray, cost_bps: float) -> dict:
+    k = 10
+    env = TradingEnv(returns, preds, k=k, cost_bps=cost_bps)
+    s = env.reset()
+    equity = 1.0
+    pos_hist = []
+    while True:
+        with torch.no_grad():
+            q = policy(torch.from_numpy(s).float().unsqueeze(0))
+            a_idx = int(q.argmax(dim=1).item())
+        action = [-1, 0, 1][a_idx]
+        s, r, done = env.step(action)
+        equity *= (1.0 + r)
+        pos_hist.append(action)
+        if done:
+            break
+    return { 'equity': equity, 'trades': int(np.sum(np.abs(np.diff(pos_hist)))) if len(pos_hist)>1 else 0 }
+
+
+# ---------------------
+# Checkpointing utility
+# ---------------------
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, loss: float, path: str):
+    """Save training checkpoint with model/optimizer states and last metric."""
+    try:
+        torch.save({
+            'epoch': int(epoch),
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': float(loss),
+        }, path)
+        logger.info(f"Checkpoint saved -> {path} (epoch={epoch}, metric={loss:.6f})")
+    except Exception as e:
+        logger.warning(f"Failed to save checkpoint to {path}: {e}")
+
+
+# ---------------------
+# Time-series cross validation
+# ---------------------
+class TimeSeriesSplit:
+    def __init__(self, n_splits: int = 5, test_size: float = 0.1):
+        self.n_splits = int(n_splits)
+        self.test_size = float(test_size)
+    def split(self, n: int):
+        test_n = max(1, int(n * self.test_size))
+        for i in range(self.n_splits):
+            split_point = n - (self.n_splits - i) * test_n
+            if split_point <= 0:
+                continue
+            train_idx = np.arange(0, split_point)
+            val_idx = np.arange(split_point, min(n, split_point + test_n))
+            yield train_idx, val_idx
+
+
+# ---------------------
+# Interpretability helpers
+# ---------------------
+def get_attention_weights(model: nn.Module, x: torch.Tensor) -> list[torch.Tensor]:
+    """Extract attention-like outputs via forward hooks from TransformerEncoder layers.
+    Note: PyTorch's nn.TransformerEncoderLayer doesn't expose weights directly; this captures the encoder outputs per layer.
+    """
+    attn_outputs: list[torch.Tensor] = []
+    hooks = []
+    def hook_fn(module, inp, out):
+        try:
+            attn_outputs.append(out.detach().cpu())
+        except Exception:
+            pass
+    # register on each encoder layer if present
+    if hasattr(model, 'encoder') and isinstance(model.encoder, nn.TransformerEncoder):
+        for layer in model.encoder.layers:
+            hooks.append(layer.register_forward_hook(hook_fn))
+    try:
+        with torch.no_grad():
+            _ = model(x)
+    finally:
+        for h in hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+    return attn_outputs
+
+
+def prepare_dataloaders(df_train: pd.DataFrame, scaler_x: RobustScaler, scaler_y: StandardScaler, n_steps: int, batch_size: int, val_split: float, cfg: Config, override_stride: int | None = None, override_val_split: float | None = None):
+    X = df_train.drop(columns=['target'])
+    y = df_train[['target']]
+    Xs = scaler_x.transform(X).astype(np.float32, copy=False)
+    ys = scaler_y.transform(y).astype(np.float32, copy=False)
+    scaled = np.concatenate([Xs, ys], axis=1)
+    stride_val = int(override_stride) if override_stride is not None else int(getattr(cfg, 'WINDOW_STRIDE', 1))
+    ds = WindowDataset(scaled, n_steps, stride=stride_val)
+    if len(ds) == 0:
+        raise ValueError("Not enough data to create windows. Reduce N_STEPS or use more data.")
+    n_total = len(ds)
+    # Split indices: chronological with a gap to avoid overlap leakage
+    val_split_eff = float(override_val_split) if override_val_split is not None else float(val_split)
+    n_val = max(1, int(round(n_total * val_split_eff))) if n_total >= 2 else 0
+    n_val = min(n_val, max(0, n_total - 1))
+    n_train = max(1, n_total - n_val)
+    stride = stride_val or 1
+    gap = int(np.ceil((n_steps / stride) * float(getattr(cfg, 'WINDOW_VAL_GAP_MULT', 1.0))))
+    rng = np.random.default_rng(42)
+    if getattr(cfg, 'VALIDATION_SPLIT_MODE', 'chronological') == 'chronological':
+        split_idx = max(1, n_train - gap)
+        train_idx = np.arange(0, split_idx, dtype=int)
+        val_idx = np.arange(split_idx, min(n_total, split_idx + n_val), dtype=int)
+        # if val is too small (edge cases), extend to available
+        if len(val_idx) == 0:
+            val_idx = np.arange(split_idx, n_total, dtype=int)
+    else:
+        idx = np.arange(n_total)
+        rng.shuffle(idx)
+        train_idx = idx[:n_train]
+        val_idx = idx[n_train:n_train + n_val]
+    # Caps
+    max_tr = int(getattr(cfg, 'MAX_TRAIN_WINDOWS', n_train) or n_train)
+    max_va = int(getattr(cfg, 'MAX_VAL_WINDOWS', n_val) or n_val)
+    if len(train_idx) > max_tr:
+        train_idx = rng.choice(train_idx, size=max_tr, replace=False)
+    if len(val_idx) > max_va:
+        val_idx = rng.choice(val_idx, size=max_va, replace=False)
+    train_ds = torch.utils.data.Subset(ds, np.sort(train_idx))
+    val_ds = torch.utils.data.Subset(ds, np.sort(val_idx))
+    # Adaptive batch size to ensure at least one batch and don't drop the last partial batch
+    bs_train = max(1, min(batch_size, len(train_ds)))
+    bs_val = max(1, min(batch_size, len(val_ds)))
+    logger.info(f"Windows total={n_total} | train={len(train_ds)} (bs={bs_train}) | val={len(val_ds)} (bs={bs_val}) | stride={stride_val}")
+    # Build DataLoader kwargs without passing unsupported params when workers=0
+    common_train = dict(batch_size=bs_train, shuffle=True, drop_last=False, num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
+    common_val = dict(batch_size=bs_val, shuffle=False, drop_last=False, num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
+    if cfg.NUM_WORKERS > 0:
+        common_train.update(prefetch_factor=cfg.PREFETCH_FACTOR, persistent_workers=cfg.PERSISTENT_WORKERS)
+        common_val.update(prefetch_factor=cfg.PREFETCH_FACTOR, persistent_workers=cfg.PERSISTENT_WORKERS)
+    return (
+        DataLoader(train_ds, **common_train),
+        DataLoader(val_ds, **common_val),
+    )
+
+
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, device: torch.device, epochs: int, lr: float, weight_decay: float, mixed_precision: bool, non_blocking: bool, grad_clip_norm: float = 0.0, min_epochs: int = 0, scaler_y: StandardScaler | None = None, cfg: Config | None = None):
+    criterion = nn.SmoothL1Loss()  # Huber loss for robustness on heavy tails
+    bce = nn.BCEWithLogitsLoss(reduction='none')
+    # Prefer AdamW (often fused on newer PyTorch builds), fallback to Adam
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay) if AdamW else Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched_mode = (getattr(cfg, 'SCHEDULER', 'plateau') if cfg is not None else 'plateau')
+    use_onecycle = (sched_mode == 'onecycle')
+    use_cosine = (sched_mode == 'cosine')
+    if use_onecycle:
+        steps_per_epoch = max(1, len(train_loader))
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=getattr(cfg, 'ONECYCLE_MAX_LR', lr * 10),
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.1,
+            div_factor=10.0,
+            final_div_factor=100.0,
+            three_phase=False,
+        )
+    elif use_cosine:
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, epochs - int(getattr(cfg, 'WARMUP_EPOCHS', 0))),
+            eta_min=getattr(cfg, 'COSINE_MIN_LR', 1e-6),
+        )
+    else:
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
+    scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision)
+
+    best_val = float('inf')
+    patience = (cfg.EARLY_STOP_PATIENCE if cfg else 10)
+    best_state = None
+    no_improve = 0
+
+    # Exponential Moving Average of weights
+    use_ema = bool(getattr(cfg, 'USE_EMA', False))
+    ema_decay = float(getattr(cfg, 'EMA_DECAY', 0.999))
+    ema_shadow = None
+    if use_ema:
+        with torch.no_grad():
+            ema_shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    # Precompute target scaler params on the right device (avoid CPU-GPU ping-pong)
+    y_mean_t = None
+    y_scale_t = None
+    if scaler_y is not None:
+        try:
+            y_mean_t = torch.tensor(float(scaler_y.mean_[0]), device=device)
+            y_scale_t = torch.tensor(float(scaler_y.scale_[0]), device=device)
+        except Exception:
+            y_mean_t = None
+            y_scale_t = None
+
+    accum_steps = int(getattr(cfg, 'GRAD_ACCUM_STEPS', 1) or 1)
+    log_grad_every = int(getattr(cfg, 'LOG_GRAD_N_STEPS', 0) or 0)
+
+    # TensorBoard writer
+    writer = None
+    if cfg is not None and getattr(cfg, 'TENSORBOARD_ENABLED', False) and SummaryWriter is not None:
+        try:
+            writer = SummaryWriter(log_dir=getattr(cfg, 'TB_LOG_DIR', 'runs/btc_prediction'))
+        except Exception:
+            writer = None
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0.0
+        batches = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, (xb, yb) in enumerate(train_loader):
+            xb = xb.to(device, non_blocking=non_blocking)
+            yb = yb.to(device, non_blocking=non_blocking)
+            with torch.cuda.amp.autocast(enabled=mixed_precision):
+                out = model(xb)
+                if isinstance(out, tuple):
+                    preds, cls_logits = out
+                else:
+                    preds, cls_logits = out, None
+                loss = criterion(preds, yb)
+                # Correlation regularization in scaled space (encourage alignment)
+                if cfg is not None and getattr(cfg, 'CORR_LOSS_WEIGHT', 0.0) > 0.0:
+                    p = preds.view(-1)
+                    t = yb.view(-1)
+                    p = p - p.mean()
+                    t = t - t.mean()
+                    denom = (p.norm(p=2) * t.norm(p=2) + 1e-8)
+                    corr = (p * t).sum() / denom
+                    corr_loss = 1.0 - corr
+                    loss = loss + cfg.CORR_LOSS_WEIGHT * corr_loss
+                # Optional classification auxiliary loss
+                if cls_logits is not None and scaler_y is not None and cfg is not None and cfg.MULTITASK:
+                    # build labels from raw target with ignore band (on-device affine inverse)
+                    if (y_mean_t is not None) and (y_scale_t is not None):
+                        y_raw = yb * y_scale_t + y_mean_t
+                    else:
+                        # rare fallback if scaler attributes missing
+                        y_raw = torch.from_numpy(scaler_y.inverse_transform(yb.detach().cpu().numpy())).to(device)
+                    mask = (y_raw.abs() >= cfg.CLS_EPSILON).float()
+                    labels = (y_raw > 0).float()
+                    if cfg.LABEL_SMOOTH > 0:
+                        labels = labels * (1.0 - cfg.LABEL_SMOOTH) + 0.5 * cfg.LABEL_SMOOTH
+                    cls_loss = bce(cls_logits, labels)
+                    cls_loss = (cls_loss.squeeze(1) * mask.squeeze(1))
+                    denom = torch.clamp(mask.sum(), min=1.0)
+                    cls_loss = cls_loss.sum() / denom
+                    # Ramp classification loss weight to avoid early domination
+                    ramp_epochs = max(1, int(getattr(cfg, 'CLS_RAMP_EPOCHS', 1)))
+                    ramp = min(1.0, float(epoch) / float(ramp_epochs))
+                    loss = loss + (cfg.CLS_LOSS_WEIGHT * ramp) * cls_loss
+
+            # Accumulate gradients to reduce per-step VRAM
+            loss_for_back = loss / accum_steps
+            scaler.scale(loss_for_back).backward()
+            do_step = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if do_step:
+                # Gradient clipping (after unscale for AMP)
+                if grad_clip_norm and grad_clip_norm > 0:
+                    try:
+                        scaler.unscale_(optimizer)
+                    except Exception:
+                        pass
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                # Update EMA after optimizer step
+                if use_ema and ema_shadow is not None:
+                    with torch.no_grad():
+                        for name, param in model.state_dict().items():
+                            ema_shadow[name].mul_(ema_decay).add_(param.detach(), alpha=1.0 - ema_decay)
+                # Step OneCycle per optimizer step
+                if use_onecycle:
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+                elif use_cosine:
+                    # CosineAnnealingLR expects step per epoch; we step per optimizer step for smoother curve
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+                # Optional gradient norm logging
+                if log_grad_every and ((batch_idx + 1) % log_grad_every == 0):
+                    try:
+                        total_norm = 0.0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.detach().data.norm(2).item()
+                                total_norm += param_norm * param_norm
+                        total_norm = total_norm ** 0.5
+                        logger.info(f"GradNorm @step {batch_idx+1}: {total_norm:.4f}")
+                    except Exception:
+                        pass
+            train_loss += loss.item() * xb.size(0)
+            batches += 1
+
+        train_loss /= max(1, len(train_loader.dataset))
+
+        # Validation
+        model.eval()
+        # Temporarily swap in EMA weights for validation if enabled
+        orig_state = None
+        if use_ema and ema_shadow is not None:
+            try:
+                orig_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                model.load_state_dict(ema_shadow, strict=False)
+            except Exception:
+                orig_state = None
+
+        val_loss = 0.0
+        val_rmse_raw_acc = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=non_blocking)
+                yb = yb.to(device, non_blocking=non_blocking)
+                with torch.cuda.amp.autocast(enabled=mixed_precision):
+                    out = model(xb)
+                    if isinstance(out, tuple):
+                        preds, cls_logits = out
+                    else:
+                        preds, cls_logits = out, None
+                    loss = criterion(preds, yb)
+                    if cls_logits is not None and scaler_y is not None and cfg is not None and cfg.MULTITASK:
+                        if (y_mean_t is not None) and (y_scale_t is not None):
+                            y_raw = yb * y_scale_t + y_mean_t
+                        else:
+                            y_raw = torch.from_numpy(scaler_y.inverse_transform(yb.detach().cpu().numpy())).to(device)
+                        mask = (y_raw.abs() >= cfg.CLS_EPSILON).float()
+                        labels = (y_raw > 0).float()
+                        if cfg.LABEL_SMOOTH > 0:
+                            labels = labels * (1.0 - cfg.LABEL_SMOOTH) + 0.5 * cfg.LABEL_SMOOTH
+                        cls_loss = bce(cls_logits, labels)
+                        cls_loss = (cls_loss.squeeze(1) * mask.squeeze(1))
+                        denom = torch.clamp(mask.sum(), min=1.0)
+                        cls_loss = cls_loss.sum() / denom
+                        ramp_epochs = max(1, int(getattr(cfg, 'CLS_RAMP_EPOCHS', 1)))
+                        ramp = min(1.0, float(epoch) / float(ramp_epochs))
+                        loss = loss + (cfg.CLS_LOSS_WEIGHT * ramp) * cls_loss
+                    # accumulate raw RMSE for early stopping metric
+                    if (y_mean_t is not None) and (y_scale_t is not None):
+                        preds_raw = preds * y_scale_t + y_mean_t
+                        y_raw = yb * y_scale_t + y_mean_t
+                    else:
+                        preds_raw = torch.from_numpy(scaler_y.inverse_transform(preds.detach().cpu().numpy())).to(device)
+                        y_raw = torch.from_numpy(scaler_y.inverse_transform(yb.detach().cpu().numpy())).to(device)
+                    se = (preds_raw.view(-1) - y_raw.view(-1)) ** 2
+                    val_rmse_raw_acc += se.sum().item()
+                val_loss += loss.item() * xb.size(0)
+
+        total_val_n = max(1, len(val_loader.dataset))
+        val_loss /= total_val_n
+        val_rmse_raw = float(np.sqrt(val_rmse_raw_acc / (total_val_n)))
+        # Restore original weights after validation
+        if orig_state is not None:
+            try:
+                model.load_state_dict(orig_state, strict=False)
+            except Exception:
+                pass
+
+        # LR scheduling per epoch for plateau
+        if sched_mode == 'plateau':
+            scheduler.step(val_rmse_raw)
+        current_lr = next(iter(optimizer.param_groups))['lr']
+
+        best_so_far = best_val if best_val != float('inf') else float('nan')
+        ema_flag = bool(getattr(cfg, 'USE_EMA', False))
+        logger.info(
+            f"Epoch {epoch:03d} | lr {current_lr:.2e} | batches {batches} | train {train_loss:.6e} | val_scaled {val_loss:.6e} | val_rmse_raw {val_rmse_raw:.6e} | best {best_so_far:.6e} | ema_val={ema_flag}"
+        )
+        if writer is not None:
+            try:
+                writer.add_scalar('Loss/train_scaled', train_loss, epoch)
+                writer.add_scalar('Loss/val_scaled', val_loss, epoch)
+                writer.add_scalar('Metric/val_rmse_raw', val_rmse_raw, epoch)
+                writer.add_scalar('LR', current_lr, epoch)
+            except Exception:
+                pass
+        if batches == 0:
+            logger.warning("No training batches produced. Consider reducing batch size or increasing data.")
+            break
+
+        # Early stopping and checkpoints
+        monitor = val_rmse_raw
+        min_delta = float(getattr(cfg, 'MIN_IMPROVE_DELTA', 0.0))
+        if (best_val - monitor) > min_delta:
+            best_val = monitor
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+            if getattr(cfg, 'SAVE_CHECKPOINTS', False):
+                try:
+                    save_checkpoint(model, optimizer, epoch, best_val, getattr(cfg, 'CHECKPOINT_BEST_PATH', 'checkpoint_best.pt'))
+                except Exception:
+                    pass
+        else:
+            no_improve += 1
+            if (epoch >= max(min_epochs, 1)) and (no_improve >= patience):
+                logger.info("Early stopping triggered")
+                # Save last before break if requested
+                if getattr(cfg, 'SAVE_CHECKPOINTS', False):
+                    try:
+                        save_checkpoint(model, optimizer, epoch, monitor, getattr(cfg, 'CHECKPOINT_LAST_PATH', 'checkpoint_last.pt'))
+                    except Exception:
+                        pass
+                break
+
+        # Save last checkpoint each epoch (for resume)
+        if getattr(cfg, 'SAVE_CHECKPOINTS', False):
+            try:
+                save_checkpoint(model, optimizer, epoch, monitor, getattr(cfg, 'CHECKPOINT_LAST_PATH', 'checkpoint_last.pt'))
+            except Exception:
+                pass
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    # Swap in EMA weights for inference if better stability
+    if use_ema and ema_shadow is not None:
+        try:
+            model.load_state_dict(ema_shadow, strict=False)
+        except Exception:
+            pass
+    if writer is not None:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def inverse_scale_predictions(preds_scaled: np.ndarray, scaler_y: StandardScaler) -> np.ndarray:
+    return scaler_y.inverse_transform(preds_scaled.reshape(-1, 1)).ravel()
+
+
+def _zero_baseline_mse(df: pd.DataFrame, scaler_y: StandardScaler) -> float:
+    ys = scaler_y.transform(df[['target']].values.astype(np.float32))
+    return float(np.mean(ys ** 2))
+
+
+def walk_forward_validate(cfg: Config, model: nn.Module, scaler_x: RobustScaler, scaler_y: StandardScaler, df_train: pd.DataFrame, df_test: pd.DataFrame, device: torch.device, mixed_precision: bool) -> Tuple[np.ndarray, np.ndarray]:
+    # Initial training dataloaders
+    train_loader, val_loader = prepare_dataloaders(df_train, scaler_x, scaler_y, cfg.N_STEPS, cfg.BATCH_SIZE, cfg.VALIDATION_SPLIT, cfg)
+    train_model(model, train_loader, val_loader, device, cfg.EPOCHS, cfg.LEARNING_RATE, cfg.WEIGHT_DECAY, mixed_precision, cfg.NON_BLOCKING, cfg.GRAD_CLIP_NORM, cfg.MIN_EPOCHS, scaler_y=scaler_y, cfg=cfg)
+
+    preds_scaled: List[float] = []
+    actuals_raw: List[float] = []
+
+    history = df_train.copy()
+    steps = min(len(df_test), cfg.WALK_FORWARD_MAX_STEPS)
+    model.eval()
+    for i in range(steps):
+        if len(history) < cfg.N_STEPS:
+            raise ValueError("Insufficient history for N_STEPS window during walk-forward.")
+        test_row = df_test.iloc[i:i+1]
+        combined = pd.concat([history.iloc[-cfg.N_STEPS:], test_row], axis=0)
+        Xc = scaler_x.transform(combined.drop(columns=['target']))
+        yc = scaler_y.transform(combined[['target']])
+        scaled = np.concatenate([Xc, yc], axis=1)
+        x_input = torch.tensor(scaled[-cfg.N_STEPS:, :-1], dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=mixed_precision):
+                out = model(x_input)
+                y_pred = out[0] if isinstance(out, tuple) else out
+                y_hat = y_pred.squeeze().item()
+        preds_scaled.append(y_hat)
+        actuals_raw.append(float(test_row['target'].values[0]))
+        history = pd.concat([history, test_row])
+        # periodic safe quick retrain for adaptation
+        if (i + 1) % cfg.RETRAIN_FREQUENCY == 0:
+            recent_window = max(cfg.RETRAIN_WINDOW_MIN, cfg.N_STEPS + 100)
+            recent = history.iloc[-recent_window:]
+            # Override stride and val split for small windows
+            tr_loader, va_loader = prepare_dataloaders(
+                recent,
+                scaler_x,
+                scaler_y,
+                cfg.N_STEPS,
+                cfg.BATCH_SIZE,
+                cfg.RETRAIN_VAL_SPLIT,
+                cfg,
+                override_stride=cfg.RETRAIN_STRIDE,
+                override_val_split=cfg.RETRAIN_VAL_SPLIT,
+            )
+
+            # Snapshot current weights for potential revert
+            revert_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+            # Optionally freeze backbone and train only heads during tiny retrains
+            frozen_params = []
+            if getattr(cfg, 'RETRAIN_HEAD_ONLY', True):
+                for name, p in model.named_parameters():
+                    # allow training of projection and heads; freeze others
+                    if any(key in name for key in ['head', 'head_cls', 'proj']):
+                        p.requires_grad_(True)
+                    else:
+                        if p.requires_grad:
+                            p.requires_grad_(False)
+                            frozen_params.append(name)
+            # Force a safe scheduler for retrain
+            prev_sched = getattr(cfg, 'SCHEDULER', 'plateau')
+            object.__setattr__(cfg, 'SCHEDULER', getattr(cfg, 'RETRAIN_SCHEDULER', 'plateau'))
+
+            # Use much smaller LR
+            retrain_lr = float(cfg.LEARNING_RATE) * float(cfg.RETRAIN_LR_MULT)
+            retrain_epochs = int(getattr(cfg, 'RETRAIN_EPOCHS', 5))
+            min_ep = max(2, retrain_epochs // 2)
+
+            # Evaluate pre-retrain val for comparison
+            pre_val_loss = 0.0
+            pre_val_rmse_acc = 0.0
+            model.eval()
+            with torch.no_grad():
+                for xb, yb in va_loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    pred = model(xb)
+                    pred = pred[0] if isinstance(pred, tuple) else pred
+                    loss_b = nn.SmoothL1Loss()(pred, yb).item()
+                    pre_val_loss += loss_b * xb.size(0)
+                    pre_val_rmse_acc += ((pred.view(-1) - yb.view(-1)) ** 2).sum().item()
+            nva = max(1, len(va_loader.dataset))
+            pre_val_loss /= nva
+            pre_val_rmse = float(np.sqrt(pre_val_rmse_acc / nva))
+
+            logger.info(f"Retrain start @step {i+1}: window={len(recent)} stride={cfg.RETRAIN_STRIDE} val_split={cfg.RETRAIN_VAL_SPLIT} lr={retrain_lr:.2e} epochs={retrain_epochs} head_only={getattr(cfg,'RETRAIN_HEAD_ONLY',True)} frozen={len(frozen_params)}")
+
+            # Train
+            train_model(
+                model,
+                tr_loader,
+                va_loader,
+                device,
+                retrain_epochs,
+                retrain_lr,
+                cfg.WEIGHT_DECAY,
+                mixed_precision,
+                cfg.NON_BLOCKING,
+                cfg.GRAD_CLIP_NORM,
+                min_epochs=min_ep,
+                scaler_y=scaler_y,
+                cfg=cfg,
+            )
+
+            # Restore training flags
+            if getattr(cfg, 'RETRAIN_HEAD_ONLY', True):
+                for name, p in model.named_parameters():
+                    p.requires_grad_(True)
+            object.__setattr__(cfg, 'SCHEDULER', prev_sched)
+
+            # Post-eval; revert if degraded
+            post_val_loss = 0.0
+            post_val_rmse_acc = 0.0
+            model.eval()
+            with torch.no_grad():
+                for xb, yb in va_loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    pred = model(xb)
+                    pred = pred[0] if isinstance(pred, tuple) else pred
+                    loss_b = nn.SmoothL1Loss()(pred, yb).item()
+                    post_val_loss += loss_b * xb.size(0)
+                    post_val_rmse_acc += ((pred.view(-1) - yb.view(-1)) ** 2).sum().item()
+            post_val_loss /= nva
+            post_val_rmse = float(np.sqrt(post_val_rmse_acc / nva))
+
+            if getattr(cfg, 'RETRAIN_REVERT_ON_DEGRADE', True) and (post_val_rmse > pre_val_rmse * 1.02):
+                logger.warning(f"Retrain degraded val RMSE ({post_val_rmse:.6e} > {pre_val_rmse:.6e}); reverting weights.")
+                model.load_state_dict(revert_state, strict=False)
+            else:
+                logger.info(f"Retrain improved/held val RMSE: {pre_val_rmse:.6e} -> {post_val_rmse:.6e}")
+        if (i + 1) % 100 == 0:
+            logger.info(f"Walk-forward {i + 1}/{steps} done")
+
+    return np.array(preds_scaled), np.array(actuals_raw)
+
+
+def main():
+    cfg = Config()
+
+    # Device & AMP
+    device = torch.device('cuda' if (cfg.USE_GPU and torch.cuda.is_available()) else 'cpu')
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.info("Using CPU")
+    mixed_precision = cfg.MIXED_PRECISION and device.type == 'cuda'
+
+    # 1) Data
+    fetcher = DataFetcher(cfg)
+    df_raw = fetcher.fetch_and_cache()
+    if cfg.MAX_BARS and len(df_raw) > cfg.MAX_BARS:
+        df_raw = df_raw.tail(cfg.MAX_BARS)
+    logger.info(f"Raw data: {df_raw.index.min()} -> {df_raw.index.max()} ({len(df_raw)})")
+
+    # 2) Features
+    df_feat = FeatureEngineer.engineer(df_raw)
+    # Optional external merges
+    df_feat = FeatureEngineer.merge_sentiment(df_feat, cfg)
+    if getattr(cfg, 'MICROSTRUCTURE_ENABLED', False):
+        df_feat = FeatureEngineer.merge_microstructure(df_feat, cfg)
+    logger.info(f"Features: {df_feat.index.min()} -> {df_feat.index.max()} ({len(df_feat)}) | cols={df_feat.shape[1]}")
+
+    # 3) Split
+    split = int(len(df_feat) * cfg.TRAIN_SPLIT_RATIO)
+    df_train = df_feat.iloc[:split]
+    df_test = df_feat.iloc[split:]
+    n_features = df_feat.shape[1] - 1
+
+    logger.info(f"Train: {df_train.index.min()} -> {df_train.index.max()} ({len(df_train)})")
+    logger.info(f"Test : {df_test.index.min()} -> {df_test.index.max()} ({len(df_test)})")
+
+    if len(df_train) < cfg.N_STEPS + 2:
+        raise ValueError("Not enough training data for the chosen N_STEPS.")
+
+    # 4) Scaling
+    X_train = df_train.drop(columns=['target'])
+    y_train = df_train[['target']]
+    scaler_x = RobustScaler().fit(X_train)
+    scaler_y = StandardScaler().fit(y_train)
+    try:
+        bz_train = _zero_baseline_mse(df_train, scaler_y)
+        bz_test = _zero_baseline_mse(df_test, scaler_y)
+        logger.info(f"Zero-baseline MSE (scaled) | train={bz_train:.4f} | test={bz_test:.4f}")
+    except Exception:
+        pass
+
+    # 5) Model
+    if cfg.USE_HYBRID:
+        model = HybridLSTMTransformerRegressor(n_features=n_features, cfg=cfg).to(device)
+        logger.info("Model: Hybrid LSTM + Transformer")
+    else:
+        model = LSTMRegressor(n_features=n_features, hidden=cfg.LSTM_HIDDEN, layers=cfg.LSTM_LAYERS, dropout=cfg.LSTM_DROPOUT).to(device)
+        logger.info("Model: LSTM")
+
+    # Optional: quick time-series CV
+    if getattr(cfg, 'RUN_CV', False):
+        tscv = TimeSeriesSplit(n_splits=getattr(cfg, 'CV_N_SPLITS', 3), test_size=getattr(cfg, 'CV_TEST_SIZE', 0.1))
+        rmses = []
+        n = len(df_train)
+        for i, (tr_idx, va_idx) in enumerate(tscv.split(n), 1):
+            df_tr = df_train.iloc[tr_idx]
+            df_va = df_train.iloc[va_idx]
+            # Fit scalers on fold train only
+            scx = RobustScaler().fit(df_tr.drop(columns=['target']))
+            scy = StandardScaler().fit(df_tr[['target']])
+            # Fresh model per fold
+            if cfg.USE_HYBRID:
+                fold_model = HybridLSTMTransformerRegressor(n_features=n_features, cfg=cfg).to(device)
+            else:
+                fold_model = LSTMRegressor(n_features=n_features, hidden=cfg.LSTM_HIDDEN, layers=cfg.LSTM_LAYERS, dropout=cfg.LSTM_DROPOUT).to(device)
+            # Dataloaders and train briefly
+            tr_loader, va_loader = prepare_dataloaders(pd.concat([df_tr, df_va]), scx, scy, cfg.N_STEPS, cfg.BATCH_SIZE, val_split=len(df_va)/max(1,len(df_tr)+len(df_va)), cfg=cfg)
+            train_model(fold_model, tr_loader, va_loader, device, getattr(cfg, 'EPOCHS_CV', 10), cfg.LEARNING_RATE, cfg.WEIGHT_DECAY, mixed_precision, cfg.NON_BLOCKING, cfg.GRAD_CLIP_NORM, min_epochs=2, scaler_y=scy, cfg=cfg)
+            # Evaluate on fold val in raw space
+            Xv = df_va.drop(columns=['target']).values
+            yv = df_va['target'].values
+            Xs = scx.transform(df_va.drop(columns=['target']))
+            ys = scy.transform(df_va[['target']])
+            scaled = np.concatenate([Xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+            ds = WindowDataset(scaled, cfg.N_STEPS, stride=getattr(cfg, 'WINDOW_STRIDE', 1))
+            dl = DataLoader(ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=cfg.PIN_MEMORY)
+            preds_scaled = []
+            with torch.no_grad():
+                for xb, yb in dl:
+                    xb = xb.to(device)
+                    with torch.cuda.amp.autocast(enabled=mixed_precision):
+                        out = fold_model(xb)
+                        yhat = out[0] if isinstance(out, tuple) else out
+                    preds_scaled.append(yhat.squeeze(1).cpu().numpy())
+            preds_scaled = np.concatenate(preds_scaled, axis=0)
+            preds_raw = inverse_scale_predictions(preds_scaled, scy)
+            # align target length to preds
+            y_true = df_va['target'].values[cfg.N_STEPS:cfg.N_STEPS+len(preds_raw)]
+            rmse_fold = float(np.sqrt(mean_squared_error(y_true, preds_raw))) if len(y_true)>0 else np.nan
+            rmses.append(rmse_fold)
+            logger.info(f"CV fold {i}: RMSE={rmse_fold:.6f}")
+        if len(rmses) > 0:
+            logger.info(f"CV mean RMSE: {np.nanmean(rmses):.6f} | std: {np.nanstd(rmses):.6f}")
+
+    # 6) Walk-forward validation
+    # Optionally compile model (PyTorch 2.x) for speed-ups under WSL/Linux
+    if getattr(cfg, 'USE_TORCH_COMPILE', False) and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(
+                model,
+                backend=getattr(cfg, 'TORCH_COMPILE_BACKEND', 'inductor'),
+                mode=getattr(cfg, 'TORCH_COMPILE_MODE', 'max-autotune'),
+                dynamic=getattr(cfg, 'TORCH_COMPILE_DYNAMIC', True),
+            )
+            logger.info("Model compiled with torch.compile (backend=%s, mode=%s, dynamic=%s)", cfg.TORCH_COMPILE_BACKEND, cfg.TORCH_COMPILE_MODE, cfg.TORCH_COMPILE_DYNAMIC)
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}; continuing without compilation")
+    preds_scaled, actuals_raw = walk_forward_validate(cfg, model, scaler_x, scaler_y, df_train, df_test, device, mixed_precision)
+
+    # 7) Inverse-scale predictions
+    preds_raw = inverse_scale_predictions(preds_scaled, scaler_y)
+
+    # 8) Metrics
+    rmse = float(np.sqrt(mean_squared_error(actuals_raw, preds_raw)))
+    mae = float(mean_absolute_error(actuals_raw, preds_raw))
+    da = float(np.mean(np.sign(actuals_raw) == np.sign(preds_raw)) * 100.0)
+    corr = float(np.corrcoef(actuals_raw, preds_raw)[0, 1]) if len(actuals_raw) > 1 else 0.0
+    print("\n" + "=" * 50)
+    print("PERFORMANCE METRICS (PyTorch)")
+    print("=" * 50)
+    print(f"RMSE                 : {rmse:.6f}")
+    print(f"MAE                  : {mae:.6f}")
+    print(f"Directional Accuracy : {da:.2f}%")
+    print(f"Correlation          : {corr:.6f}")
+    print("=" * 50)
+
+    # 9) Plot
+    plt.figure(figsize=(14, 6))
+    plt.plot(np.cumsum(actuals_raw), label='Actual Cumulative', color='blue')
+    plt.plot(np.cumsum(preds_raw), label='Predicted Cumulative', color='red', alpha=0.7)
+    plt.title('Walk-Forward: Cumulative Log Returns (PyTorch)')
+    plt.xlabel('Step')
+    plt.ylabel('Cumulative Log Return')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('prediction_results_pytorch.png', dpi=150)
+    plt.show()
+
+    # 10) Optional RL Predictor
+    if cfg.RL_PREDICT_ENABLED:
+        device_rl = torch.device('cuda' if (cfg.USE_GPU and torch.cuda.is_available()) else 'cpu')
+        rl_pred = train_rl_predictor(cfg, df_train, scaler_x, scaler_y, cfg.N_STEPS, device_rl)
+        rl_preds_scaled, rl_actuals_scaled = eval_rl_predictor(rl_pred, df_test, scaler_x, scaler_y, device_rl, cfg.RL_PRED_N_BINS)
+        rl_preds_raw = inverse_scale_predictions(rl_preds_scaled, scaler_y)
+        rl_actuals_raw = inverse_scale_predictions(rl_actuals_scaled, scaler_y)
+        rl_rmse = float(np.sqrt(mean_squared_error(rl_actuals_raw, rl_preds_raw)))
+        rl_mae = float(mean_absolute_error(rl_actuals_raw, rl_preds_raw))
+        rl_da = float(np.mean(np.sign(rl_actuals_raw) == np.sign(rl_preds_raw)) * 100.0)
+        rl_corr = float(np.corrcoef(rl_actuals_raw, rl_preds_raw)[0, 1]) if len(rl_actuals_raw) > 1 else 0.0
+        print("\nRL PREDICTOR METRICS")
+        print("=" * 50)
+        print(f"RMSE                 : {rl_rmse:.6f}")
+        print(f"MAE                  : {rl_mae:.6f}")
+        print(f"Directional Accuracy : {rl_da:.2f}%")
+        print(f"Correlation          : {rl_corr:.6f}")
+        print("=" * 50)
+
+    # 11) Optional RL Trading
+    if cfg.RL_TRADING_ENABLED and len(actuals_raw) > 100:
+        rl_policy = train_dqn(cfg, actuals_raw, preds_raw, device=torch.device('cpu'))
+        rl_stats = eval_dqn(rl_policy, actuals_raw, preds_raw, cost_bps=cfg.TRANSACTION_COST_BPS)
+        print("RL Trading Evaluation:", rl_stats)
+        try:
+            torch.save(rl_policy.state_dict(), cfg.RL_POLICY_PATH)
+        except Exception:
+            pass
+
+    # 12) Save
+    torch.save(model.state_dict(), cfg.FINAL_MODEL_PATH)
+    joblib.dump(scaler_x, cfg.SCALER_X_PATH)
+    joblib.dump(scaler_y, cfg.SCALER_Y_PATH)
+    logger.info("Saved model and scaler (PyTorch)")
+
+
+if __name__ == '__main__':
+    main()
