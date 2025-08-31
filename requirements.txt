@@ -1,0 +1,12 @@
+numpy
+pandas
+pyarrow
+TA-Lib
+matplotlib
+binance-connector
+scikit-learn
+tensorflow
+keras
+python-dotenv
+joblib
+torch
