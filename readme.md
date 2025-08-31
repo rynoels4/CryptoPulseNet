@@ -31,7 +31,7 @@
 Clone and install dependencies:
 
 ```bash
-git clone https://github.com/youruser/pulsebtc.git
+git clone https://github.com/rynoels4/pulsebtc.git
 cd pulsebtc
 python -m venv .venv
 source .venv/bin/activate    # on Windows: .venv\Scripts\activate
